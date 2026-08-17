@@ -4,134 +4,180 @@
 #
 # 设计意图：
 #   对标 DeepSeek Harness 的 ctx.systemPrompt 核心服务。
-#   系统提示是 Agent 的"行为总纲"，包含三部分：
-#     1. 身份/角色提示（基础行为准则）
-#     2. 工具 Schema（告诉模型有哪些工具可用、怎么调用）
-#     3. 循环规则（ReAct 的 Thought/Action/Observation/Final Answer 格式）
 #
-#   本服务提供"区块（block）"注册机制，任何插件都能通过 ctx.effect 可逆地
-#   追加/移除提示区块，实现系统提示的动态、可插拔组装。
+#   ★ 增强版（90%+）：
+#     · block 开关：enable_block / disable_block（不删除，只是禁用）
+#     · identity 感知：自动从 ctx.identity 注入 Agent 身份信息
+#     · 条件区块：only_if 条件函数，动态决定是否包含
+#     · 区块查询：get_block_ids / get_disabled_blocks
 #
-# 服务键：
-#   'systemPrompt' —— 对外暴露一个 SystemPromptBuilder 实例。
+#   ★ SystemPromptBuilder 继承 Service 基类，自动注册 + init 钩子。
 # ============================================================================
 
 import logging
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional
 
-from mycordis import Context, Plugin
+from mycordis import Context, Plugin, Service
 
-# 本模块的日志记录器。
 logger = logging.getLogger(__name__)
 
 
-class SystemPromptBuilder:
+class SystemPromptBuilder(Service):
     """
-    系统提示组装器：按顺序把多个提示区块和工具 Schema 拼成最终系统提示。
+    系统提示组装器（对标 DSH Service 基类）。
+
+    ★ 增强版（90%+）：
+      · block 开关：enable_block / disable_block
+      · identity 感知：自动从 ctx.identity 注入 Agent 身份信息
+      · 条件区块：add_conditional_block
     """
 
-    def __init__(self, base_prompt: Optional[str] = None):
-        """
-        初始化组装器。
-
-        :param base_prompt: 可选的初始基础提示（身份/角色），可为空。
-        """
-        # 基础提示（可选）：通常是 Agent 的身份与总体行为准则。
+    def __init__(self, ctx: Context, name: str = "systemPrompt",
+                 base_prompt: Optional[str] = None):
         self.base_prompt = base_prompt or ""
-
-        # 提示区块表：key 为区块 id，value 为 (order, text)。
-        # order 用于排序，数值越小越靠前；text 为区块内容。
         self._blocks: Dict[str, tuple] = {}
+        self._disabled_blocks: set = set()
+        self._conditional_blocks: Dict[str, Callable] = {}
+        super().__init__(ctx, name)
+
+    def init(self):
+        """★ init 钩子。"""
+        self.ctx.logger.info("系统提示组装器已初始化 (init hook)")
 
     def add_block(self, block_id: str, text: str, order: int = 100) -> None:
         """
-        注册一个提示区块（可逆副作用由调用方通过 ctx.effect 管理，或本类提供 remove）。
+        注册一个提示区块。
 
-        :param block_id: 区块唯一标识，用于后续移除。
+        :param block_id: 区块唯一标识。
         :param text:     区块内容。
-        :param order:    排序权重，数值越小越靠前（默认 100）。
+        :param order:    排序权重，数值越小越靠前。
         """
         self._blocks[block_id] = (order, text)
-        logger.debug(f"[SystemPrompt] 添加区块: {block_id}")
+        self._disabled_blocks.discard(block_id)
+        self.ctx.logger.debug(f"[SystemPrompt] 添加区块: {block_id}")
 
     def remove_block(self, block_id: str) -> None:
-        """
-        移除一个提示区块。
-
-        :param block_id: 要移除的区块 id。
-        """
+        """移除一个提示区块。"""
         if block_id in self._blocks:
             del self._blocks[block_id]
-            logger.debug(f"[SystemPrompt] 移除区块: {block_id}")
+            self._disabled_blocks.discard(block_id)
+            self._conditional_blocks.pop(block_id, None)
+            self.ctx.logger.debug(f"[SystemPrompt] 移除区块: {block_id}")
 
     def add_tool_schema(self, tool_name: str, schema: str) -> None:
-        """
-        注册一个工具 Schema（以文本形式，如 JSON Schema 字符串）。
-
-        :param tool_name: 工具名，用于去重。
-        :param schema:    工具的 JSON Schema 描述字符串。
-        """
+        """注册一个工具 Schema。"""
         self.add_block(f"tool_{tool_name}", schema, order=200)
-        logger.debug(f"[SystemPrompt] 添加工具 Schema: {tool_name}")
+        self.ctx.logger.debug(f"[SystemPrompt] 添加工具 Schema: {tool_name}")
 
     def remove_tool_schema(self, tool_name: str) -> None:
-        """
-        移除一个工具 Schema。
-
-        :param tool_name: 工具名。
-        """
+        """移除一个工具 Schema。"""
         self.remove_block(f"tool_{tool_name}")
 
+    # ------------------------------------------------------------------
+    # ★ block 开关
+    # ------------------------------------------------------------------
+    def enable_block(self, block_id: str) -> None:
+        """★ 启用一个已禁用的区块。"""
+        self._disabled_blocks.discard(block_id)
+
+    def disable_block(self, block_id: str) -> None:
+        """★ 禁用一个区块（不删除，只是不参与组装）。"""
+        if block_id in self._blocks:
+            self._disabled_blocks.add(block_id)
+
+    def add_conditional_block(self, block_id: str, text: str, order: int,
+                              condition_fn: Callable) -> None:
+        """
+        ★ 添加条件区块：只有 condition_fn() 返回 True 时才包含。
+        """
+        self.add_block(block_id, text, order)
+        self._conditional_blocks[block_id] = condition_fn
+
+    def get_block_ids(self) -> List[str]:
+        """★ 获取所有已注册的区块 ID。"""
+        return list(self._blocks.keys())
+
+    def get_disabled_blocks(self) -> List[str]:
+        """★ 获取当前被禁用的区块 ID。"""
+        return list(self._disabled_blocks)
+
+    # ------------------------------------------------------------------
+    # 组装
+    # ------------------------------------------------------------------
     def build(self) -> str:
         """
         按顺序组装最终系统提示。
 
-        组装顺序：
-          1. 基础提示（base_prompt）
-          2. 所有区块按 order 升序排列（含工具 Schema）
-          3. 各区块之间用空行分隔
-
-        :return: 组装好的完整系统提示字符串。
+        ★ 增强：
+          · 跳过被 disable 的区块
+          · 跳过条件不满足的区块
+          · ★ 自动注入 identity 信息
         """
-        # 收集所有区块的 (order, text)，按 order 升序排序。
-        ordered_blocks = sorted(self._blocks.values(), key=lambda x: x[0])
-
-        # 把所有文本拼成一段，区块间用两个换行分隔。
         sections = []
         if self.base_prompt:
             sections.append(self.base_prompt)
-        for _, text in ordered_blocks:
+
+        # ★ identity 感知注入。
+        identity_section = self._build_identity_section()
+        if identity_section:
+            sections.append(identity_section)
+
+        for block_id, (order, text) in sorted(
+            [(bid, bv) for bid, bv in self._blocks.items()],
+            key=lambda x: x[1][0]
+        ):
+            if block_id in self._disabled_blocks:
+                continue
+            if block_id in self._conditional_blocks:
+                try:
+                    if not self._conditional_blocks[block_id]():
+                        continue
+                except Exception:
+                    continue
             if text:
                 sections.append(text)
 
-        # 拼接并返回。
         return "\n\n".join(sections).strip()
+
+    def _build_identity_section(self) -> str:
+        """★ 从 ctx.identity 构建 Agent 身份信息区块。"""
+        try:
+            identity = self.ctx.get("identity")
+            agent_ids = identity.list_identities()
+            if not agent_ids:
+                return ""
+            parts = []
+            for aid in agent_ids:
+                if aid.startswith("__"):
+                    continue
+                ai = identity.get_agent_identity(aid)
+                if ai:
+                    parts.append(f"You are {ai.name} (role: {ai.role}). {ai.description}")
+                    if ai.metadata:
+                        meta_str = ", ".join(
+                            f"{k}={v}" for k, v in ai.metadata.items()
+                            if not k.startswith("_")
+                        )
+                        if meta_str:
+                            parts.append(f"Metadata: {meta_str}")
+            return "\n".join(parts) if parts else ""
+        except (KeyError, AttributeError):
+            return ""
 
 
 class SystemPromptPlugin(Plugin):
-    """
-    提供系统提示组装服务（服务键 'systemPrompt'）。
-    """
+    """提供系统提示组装服务（服务键 'systemPrompt'）。"""
 
-    # --- 插件声明 ---
-
-    # inject：本插件不依赖任何其他服务。
     inject = []
-
-    # provide：本插件对外提供 'systemPrompt' 服务。
     provide = ['systemPrompt']
 
-    # --- 激活逻辑 ---
     async def apply(self, ctx: Context):
-        # 创建系统提示组装器（此处传入一个基础身份提示，可自定义）。
-        builder = SystemPromptBuilder(
+        SystemPromptBuilder(
+            ctx,
             base_prompt=(
                 "You are a helpful AI agent that uses tools to solve tasks. "
                 "Follow the ReAct pattern: think step by step, call tools when needed, "
                 "and give a final answer when done."
-            )
+            ),
         )
-
-        # 注册为 'systemPrompt' 服务。
-        ctx.provide('systemPrompt', builder, self.name or 'SystemPromptPlugin')
-        logger.info("[SystemPromptPlugin] 系统提示服务已就绪")
+        ctx.logger.info("[SystemPromptPlugin] 系统提示服务已就绪 (block 开关 + identity 感知)")

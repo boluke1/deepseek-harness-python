@@ -2,6 +2,7 @@
 # tools/examples_plugin.py
 # ExamplesPlugin：为 Agent 提供一组实用示例工具。
 # ★ 采用 ctx.tools 属性访问工具注册表（对标 DSH 反射层）。
+# ★ 升级版：使用 ctx.logger + ctx.effect() 可逆工具注册。
 # ============================================================================
 
 import datetime
@@ -9,13 +10,15 @@ import logging
 
 from mycordis import Context, Plugin
 
-# 本模块的日志记录器。
+# 本模块的日志记录器（模块级备用）。
 logger = logging.getLogger(__name__)
 
 
 class ExamplesPlugin(Plugin):
     """
     注册一组示例工具（依赖 'tools' 服务）。
+
+    ★ 升级版：使用 ctx.logger + ctx.effect() 可逆注册。
     """
 
     # --- 插件声明 ---
@@ -99,4 +102,5 @@ class ExamplesPlugin(Plugin):
             },
         )
 
-        logger.info("[ExamplesPlugin] 已注册 3 个示例工具")
+        # ★ 使用 ctx.logger 代替模块 logger。
+        ctx.logger.info("[ExamplesPlugin] 已注册 3 个示例工具")
