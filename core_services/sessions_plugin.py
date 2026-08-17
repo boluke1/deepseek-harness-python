@@ -4,21 +4,17 @@
 #
 # 设计意图：
 #   对标 DeepSeek Harness 的 ctx.sessions 核心服务，实现"会话即单一真实来源"。
-#   会话中的每条记录都是一个"不可变事件"（只追加，不修改、不删除），
-#   因此整个对话历史可以随时被完整回放 / 重建，作为模型上下文的基础。
+#   会话中的每条记录都是一个"不可变事件"（只追加，不修改、不删除）。
 #
-# 服务键：
-#   'sessions' —— 对外暴露一个 SessionManager 实例。
-#
-# 在框架中的协作：
-#   - inject = []：本插件不依赖任何服务，注册即激活。
-#   - provide = ['sessions']：提供会话管理能力，供后续的 Agent Loop 等插件使用。
+#   ★ 接入"不变式校验器"（对标 DSH session/invariant.ts）。
+#   ★ get_messages 过滤元事件/中间态，避免污染模型上下文。
 # ============================================================================
 
 import logging
 from typing import Dict, List, Optional
 
 from mycordis import Context, Plugin
+from .invariant import SessionInvariantValidator, InvariantError
 
 # 本模块的日志记录器。
 logger = logging.getLogger(__name__)
@@ -27,8 +23,6 @@ logger = logging.getLogger(__name__)
 class Session:
     """
     单个会话的历史容器（事件日志）。
-
-    采用"事件溯源"思想：所有交互都以不可变事件的形式追加到 events 列表。
     """
 
     def __init__(self, session_id: str):
@@ -37,76 +31,76 @@ class Session:
 
         :param session_id: 会话的唯一标识。
         """
-        # 会话唯一标识。
         self.id = session_id
-
-        # 事件列表：按时间顺序保存本会话的所有交互事件（只追加，不可变）。
-        # 每个事件形如：
-        #   {
-        #       "type": "user_message" | "assistant_message" | "tool_call" | "tool_result",
-        #       "content": "...",      # 事件内容
-        #       "meta": {...},         # 可选元数据（如工具名、参数、时间戳等）
-        #   }
         self.events: List[Dict] = []
+        self._validator = SessionInvariantValidator()
 
     def append(self, event_type: str, content: str, meta: Optional[Dict] = None) -> Dict:
         """
-        追加一个不可变事件到本会话。
+        追加一个不可变事件到本会话，并自动做不变式校验。
 
-        :param event_type: 事件类型，见上方 events 注释中的取值。
-        :param content:    事件内容（通常是文本）。
-        :param meta:       可选元数据字典（如工具名、参数、时间戳等）。
+        :param event_type: 事件类型。
+        :param content:    事件内容。
+        :param meta:       可选元数据。
         :return:           刚追加的事件字典。
+        :raises InvariantError: 违反不变式时抛出（事件不会被记录）。
         """
-        # 构造一个事件记录。
         event = {
             "type": event_type,
             "content": content,
             "meta": meta or {},
         }
-        # 只追加到事件列表（append-only，不修改历史）。
+        # 先校验，再追加。
+        self._validator.validate(event)
         self.events.append(event)
         logger.debug(f"[Session:{self.id}] 追加事件 {event_type}")
         return event
+
+    def finalize(self) -> None:
+        """
+        流程结束时校验。
+        """
+        self._validator.finalize()
+
+    def validate(self) -> None:
+        """
+        全量重校验当前事件列表。
+        """
+        self._validator.validate_all(self.events)
 
     def get_messages(self) -> List[Dict]:
         """
         把本会话的事件历史转换为 OpenAI 格式的消息列表。
 
-        LLM 可直接使用该结果作为对话上下文（messages）。
-
-        关键规则（★ 修复）：
-          对于"附带工具调用元信息（meta.tool_calls）"的 assistant 事件，
-          它们是 Agent 循环中的"中间态"（表示模型决定调用工具），
-          其占位 content 不应注入模型历史——否则会在后续轮次中污染模型上下文
-          （模型可能错误引用这类占位文本，如把 "(调用工具中)" 当成回复内容）。
+        过滤规则：
+          · 元事件（turn/start、step/start、turn/end）跳过。
+          · 中间态（带 tool_calls 的 assistant_message、assistant/chunk、tool_call）跳过。
+          · tool_result 以 Observation 形式注入。
 
         :return: 形如 [{"role": "user", "content": "..."}, ...] 的消息列表。
         """
+        # 元事件与中间态：不注入模型上下文。
+        SKIP_EVENTS = {"turn/start", "step/start", "turn/end", "assistant/chunk", "tool_call"}
+
         messages: List[Dict] = []
         for event in self.events:
             event_type = event["type"]
             content = event["content"]
 
-            # 根据事件类型映射为 OpenAI 的 role。
+            # 跳过元事件与中间态。
+            if event_type in SKIP_EVENTS:
+                continue
+
             if event_type == "user_message":
                 messages.append({"role": "user", "content": content})
             elif event_type == "assistant_message":
-                # ★ 修复：若该 assistant 事件附带工具调用元信息，则跳过。
-                # 工具调用的意图已通过后续的 tool_result(Observation) 事件体现，
-                # 无需在此注入占位文本，避免污染模型上下文。
                 meta = event.get("meta", {})
                 if meta.get("tool_calls"):
-                    continue
+                    continue   # 中间态，不注入
                 messages.append({"role": "assistant", "content": content})
-            elif event_type == "tool_call":
-                # 工具调用：把"调用意图"以 user 角色注入（简化处理）。
-                messages.append({"role": "user", "content": f"Tool call: {content}"})
             elif event_type == "tool_result":
-                # 工具结果：作为 user 角色的观察（Observation）注入。
                 messages.append({"role": "user", "content": f"Observation: {content}"})
             else:
-                # 未知类型：以 user 角色兜底，保证不丢数据。
                 messages.append({"role": "user", "content": str(content)})
 
         return messages
@@ -118,27 +112,21 @@ class SessionManager:
     """
 
     def __init__(self):
-        """初始化会话仓库，准备一个空的会话字典。"""
-        # 会话表：key 为会话 id，value 为 Session 实例。
+        """初始化会话仓库。"""
         self._sessions: Dict[str, Session] = {}
 
     def create(self, session_id: Optional[str] = None) -> Session:
         """
         新建一个会话并返回它。
 
-        :param session_id: 可选的自定义会话 id；若为 None 则自动生成。
+        :param session_id: 可选的自定义会话 id。
         :return:           新建的 Session 实例。
         """
-        # 若未提供 id，则生成一个自增/时间戳 id（保证不冲突）。
         if session_id is None:
             session_id = f"session_{len(self._sessions) + 1}"
-
-        # 若 id 已存在，则复用已有会话（幂等）。
         if session_id in self._sessions:
             logger.warning(f"会话 {session_id} 已存在，复用之。")
             return self._sessions[session_id]
-
-        # 创建会话并登记。
         session = Session(session_id)
         self._sessions[session_id] = session
         logger.info(f"[Sessions] 创建会话: {session_id}")
@@ -183,18 +171,11 @@ class SessionsPlugin(Plugin):
     """
 
     # --- 插件声明 ---
-
-    # inject：本插件不依赖任何其他服务。
     inject = []
-
-    # provide：本插件对外提供 'sessions' 服务（会话管理能力）。
     provide = ['sessions']
 
     # --- 激活逻辑 ---
     async def apply(self, ctx: Context):
-        # 创建会话管理器实例。
         manager = SessionManager()
-
-        # 把会话管理能力注册为 'sessions' 服务，供其他插件（如 Agent Loop）使用。
         ctx.provide('sessions', manager, self.name or 'SessionsPlugin')
         logger.info("[SessionsPlugin] 会话日志服务已就绪")

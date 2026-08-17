@@ -2,155 +2,207 @@
 # mycordis/core/context.py
 # 上下文（Context）：整个插件系统的"服务容器"与"可逆副作用栈"。
 #
-# 设计意图：
-#   Context 是插件之间进行解耦通信的核心载体，主要承担三件事：
-#     1. 存储服务（provide）：插件把自身提供的能力（如 'llm'、'agent'）注册进来。
-#     2. 解析依赖（get）：插件通过它向上查找自己需要的服务（如 'llm'）。
-#     3. 管理清理（effect / revert）：插件把"撤销副作用"的函数登记到 LIFO 栈，
-#        当插件被停用/卸载时统一按逆序执行，保证资源可回收、状态可还原。
+# 设计意图（对标 DeepSeek Harness / Cordis 的 context.ts + reflect.ts）：
+#   Context 是插件之间进行解耦通信的核心载体，负责：
+#     1. 存储服务（provide）：插件把自身提供的能力注册进来。
+#     2. 解析依赖：ctx.xxx 直接以"属性访问"方式拿到服务（反射层）。
+#     3. 管理清理（effect / revert）：把撤销副作用登记到 LIFO 栈，卸载时逆序执行。
 #
-#   它还通过 "父指针（parent）" 建立起一棵上下文树：
-#   - 根上下文（_root_ctx）持有所有全局可见的服务；
-#   - 每个插件拥有一棵独立的隔离子上下文，互不污染；
-#   - 子上下文找不到服务时，会沿着 parent 一路向上递归查找（继承）。
-#
-# 命名约定：
-#   - 下划线开头的成员（_services/_providers/_disposers）均为"内部实现细节"，
-#     外部不应直接访问，而应通过 provide/get/effect/revert 等公开方法操作。
+#   ★ 对标 DSH 的核心增强：
+#     · 服务即属性：provide 后，ctx.llm / ctx.sessions 可直接访问服务。
+#     · internal/get 走事件：服务解析可被监听器拦截。
+#     · get() 同步（支持同步监听器）、aget() 异步（支持异步 waterfall）。
+#     · Symbol 标签作用域：isolate(name, label) 用 object() 做"标签墙"。
+#     · provide 是可逆副作用：revert() 时服务自动移除。
 # ============================================================================
 
-from typing import Dict, Any, Optional, Callable, Awaitable, List,TYPE_CHECKING
-# ---- 新增：延迟导入 EventEmitter，避免 events.py 与 context.py 循环依赖 ----
-if TYPE_CHECKING:
-    from .events import EventEmitter
-
+from typing import Dict, Any, Optional, Callable, Awaitable, List
 
 
 class Context:
     """
-    上下文是服务的容器。
-
-    负责存储插件提供的服务（provide），以及向上查找依赖（get）。
-    同时维护一个"可逆副作用栈"（disposers），用于卸载时清理。
-
-    --- 角色定位 ---
-    · 服务仓库：_services 以 key->value 形式保存服务实例。
-    · 提供者索引：_providers 记录每个服务是由哪个插件提供的，方便调试与精确回收。
-    · 副作用栈：_disposers 用 LIFO 顺序保存清理函数，revert() 时按逆序执行。
-    · 继承链：parent 让子上下文可以"借用"父级（乃至根级）的服务，实现依赖向上查找。
+    上下文是服务的容器，并充当"反射层"——ctx.xxx 即服务。
     """
 
     def __init__(self, parent: Optional['Context'] = None):
         """
         初始化一个上下文实例。
 
-        :param parent: 父上下文。若为 None，则此上下文即为"根上下文"；
-                       若不为 None，则当前上下文是 parent 的一个子上下文，
-                       找不到服务时会向 parent 递归查找。
+        :param parent: 父上下文。若为 None，则为"根上下文"。
         """
-        # 父上下文指针，用于构建"上下文树"，实现服务的向上继承查找。
         self.parent = parent
-
-        # 服务仓库：key 为服务名（如 'llm'），value 为任意对象（如 LLM 客户端实例）。
-        # 当前层级注册的所有服务都存放于此；子上下文各自拥有独立的 _services，互不干扰。
         self._services: Dict[str, Any] = {}
-
-        # 提供者索引：key 为服务名，value 为该服务是由哪个插件名提供的。
-        # 用于调试定位服务来源，以及在卸载插件时精确移除其提供的服务。
         self._providers: Dict[str, str] = {}
-
-        # 可逆副作用栈（LIFO / 后进先出）。
-        # 元素是"清理函数"（disposer），形如 async () -> None。
-        # 插件在 apply 中调用 effect() 登记，revert() 时按相反顺序逐个执行，
-        # 从而保证"先注册的副作用后清理"，还原到初始状态。
+        self._scopes: Dict[str, object] = {}
+        self.__expected_scope: Dict[str, object] = {}
         self._disposers: List[Callable[[], Awaitable[None]]] = []
-
-        # 事件发射器：类型化事件系统（emit/waterfall/parallel/serial）。
-        # 由 events.py 的 EventEmitter 初始化；这里先占位为 None，懒加载。
         self._events = None
 
-
     # ------------------------------------------------------------------
-    # 服务注册与获取
+    # 服务注册（可逆副作用）
     # ------------------------------------------------------------------
-    def provide(self, key: str, value: Any, plugin_name: str) -> None:
+    def provide(self, key: str, value: Any, plugin_name: str = "") -> None:
         """
-        在当前上下文注册一个服务。
+        在当前上下文注册一个服务（自动登记可逆反注册副作用）。
 
-        若 key 已存在，则抛出 ValueError，避免同名服务被覆盖而产生歧义。
-
-        :param key:         服务名（服务键），如 'llm'。
-        :param value:       服务实例，可以是任意对象。
-        :param plugin_name: 提供该服务的插件名，写入 _providers 用于溯源。
-        :raises ValueError: 当 key 在当前层级已存在时抛出。
+        :param key:         服务名。
+        :param value:       服务实例。
+        :param plugin_name: 提供该服务的插件名。
+        :raises ValueError: key 已存在时抛出。
         """
-        # 防重复：同一层级的服务名必须唯一。
         if key in self._services:
             raise ValueError(f"Service '{key}' is already provided by {self._providers.get(key)}")
 
-        # 写入服务仓库，并登记提供者。
         self._services[key] = value
         self._providers[key] = plugin_name
+        if key not in self._scopes:
+            self._scopes[key] = object()
 
+        async def _dispose():
+            self._services.pop(key, None)
+            self._providers.pop(key, None)
+
+        self._disposers.append(_dispose)
+
+    # ------------------------------------------------------------------
+    # 服务获取
+    # ------------------------------------------------------------------
     def get(self, key: str) -> Any:
         """
-        获取服务：优先在当前上下文查找，找不到则向父级递归查找。
+        同步获取服务（支持同步 internal/get 监听器拦截）。
 
-        :param key: 服务名（服务键），如 'llm'。
+        :param key: 服务名。
         :return:    服务实例。
-        :raises KeyError: 当在整个上下文链上都找不到该服务时抛出。
+        :raises KeyError: 找不到时抛出。
         """
-        # 1) 先在当前层级查找。
+        resolved = self._resolve_service_via_events(key)
+        if resolved is not None:
+            return resolved
+        return self._lookup(key)
+
+    async def aget(self, key: str) -> Any:
+        """
+        异步获取服务（对标 DSH 的异步服务解析）。
+
+        与 get() 不同，aget() 支持异步 internal/get 监听器（可 await），
+        因为它是 async 方法，可以真正执行 waterfall。
+
+        :param key: 服务名。
+        :return:    服务实例。
+        :raises KeyError: 找不到时抛出。
+        """
+        # 若事件系统已初始化，走真正的异步 waterfall。
+        if self._events is not None:
+            result = await self._events.waterfall("internal/get", key)
+            if result is not None and result != key:
+                return result
+        # 普通查找。
+        return self._lookup(key)
+
+    def _resolve_service_via_events(self, key: str):
+        """
+        尝试通过 internal/get 事件监听器解析服务（仅同步监听器）。
+
+        :param key: 服务名。
+        :return:    拦截结果或 None。
+        """
+        try:
+            if self._events is None:
+                return None
+            listeners = self._events._get_listeners('internal/get')
+            if not listeners:
+                return None
+            for listener in listeners:
+                res = listener(key)
+                import asyncio
+                if asyncio.iscoroutine(res):
+                    continue
+                if res is not None:
+                    return res
+            return None
+        except Exception:
+            return None
+
+    def _lookup(self, key: str) -> Any:
+        """
+        普通服务查找：沿上下文链向上，并遵守作用域标签墙。
+
+        :param key: 服务名。
+        :return:    服务实例。
+        :raises KeyError: 找不到或标签墙阻断时抛出。
+        """
         if key in self._services:
             return self._services[key]
 
-        # 2) 当前层级没有，则向上交给父上下文递归查找（实现"继承"）。
-        if self.parent:
-            return self.parent.get(key)
+        expected = self.__expected_scope.get(key)
 
-        # 3) 已到根上下文仍找不到，说明该依赖缺失。
+        if self.parent:
+            if expected is not None:
+                parent_has = key in self.parent._services
+                parent_label = self.parent._scopes.get(key)
+                if not parent_has or parent_label is not expected:
+                    raise KeyError(
+                        f"Service '{key}' is isolated by scope tag, "
+                        f"cannot access from parent"
+                    )
+                return self.parent._services[key]
+            else:
+                return self.parent._lookup(key)
+
         raise KeyError(f"Service '{key}' not found in context chain")
 
     # ------------------------------------------------------------------
-    # 隔离
+    # 服务即属性（反射层）
     # ------------------------------------------------------------------
-    def isolate(self) -> 'Context':
+    def __getattr__(self, name: str) -> Any:
         """
-        创建当前上下文的隔离子上下文（parent 指向 self）。
+        让 ctx.xxx 直接返回服务。
 
-        子上下文拥有独立的 _services / _providers / _disposers，
-        因此向子上下文注入的服务不会污染父级；但它可以向上查找到父级的服务。
-        每个插件都会通过 _root_ctx.isolate() 获得这样一个专属子上下文。
-
-        :return: 一个新的 Context 实例，其 parent 为当前上下文。
+        :param name: 属性名（同时也是服务名）。
+        :return:     服务实例。
+        :raises AttributeError: 既非属性也非服务时抛出。
         """
-        return Context(parent=self)
+        if name.startswith('_'):
+            raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
+        try:
+            return self.get(name)
+        except KeyError:
+            raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
+
+    # ------------------------------------------------------------------
+    # 隔离（Symbol 标签作用域）
+    # ------------------------------------------------------------------
+    def isolate(self, name: str = None, label: object = None) -> 'Context':
+        """
+        创建当前上下文的隔离子上下文。
+
+        :param name:  可选，要隔离的服务名。
+        :param label: 可选，隔离标签（object 实例，作为 Symbol 使用）。
+        :return:      一个新的 Context 实例。
+        """
+        child = Context(parent=self)
+        if name is not None:
+            child.__expected_scope[name] = label if label is not None else object()
+        return child
 
     # ------------------------------------------------------------------
     # 可逆副作用管理
     # ------------------------------------------------------------------
     def effect(self, disposer: Callable[[], Awaitable[None]]) -> None:
         """
-        注册一个可逆副作用（清理函数），压入 LIFO 栈 _disposers。
+        注册一个可逆副作用（清理函数），压入 LIFO 栈。
 
-        插件在 apply 中调用此方法登记"卸载时要做的事"，
-        例如关闭连接、释放资源、移除全局监听器等。
-
-        :param disposer: 一个 async 清理函数，形如 async def dispose(): ...
+        :param disposer: 一个 async 清理函数。
         """
         self._disposers.append(disposer)
 
     async def revert(self) -> None:
         """
-        按 LIFO（后进先出）顺序执行并清空 _disposers 中的所有清理函数。
+        按 LIFO 顺序执行并清空 _disposers 中的所有清理函数。
 
-        之所以逆序执行，是因为副作用往往存在依赖关系：
-        后注册的副作用可能建立在前一个副作用之上，因此应先撤销后注册的。
-        当插件被停用或卸载时，Registry 会调用它来触发清理。
-
-        注意：单个 disposer 抛出的异常会向外传播，调用方需自行兜底。
+        因为 provide() 会自动登记反注册副作用，所以 revert() 后
+        本上下文注册的所有服务都会被自动移除。
         """
-        # 反复从栈顶弹出并执行，直到栈空，从而保证 LIFO 顺序。
         while self._disposers:
             disposer = self._disposers.pop()
             await disposer()
@@ -162,18 +214,24 @@ class Context:
         """
         查询某个服务是由哪个插件提供的（沿 parent 向上递归查找）。
 
-        用于调试定位服务来源，或在卸载时判断某服务是否属于某插件。
-
         :param key: 服务名。
-        :return:    提供该服务的插件名；若整个上下文链上都未登记，返回 None。
+        :return:    提供该服务的插件名；找不到返回 None。
         """
-        # 1) 先在当前层级查找提供者索引。
         if key in self._providers:
             return self._providers[key]
-
-        # 2) 当前层级没有，则向父级递归查找。
         if self.parent:
             return self.parent.get_provider_name(key)
-
-        # 3) 已到根仍未找到，返回 None 表示"无人提供"。
         return None
+
+
+def ensure_events(ctx: 'Context'):
+    """
+    确保某上下文已绑定 EventEmitter，返回之（懒加载）。
+
+    :param ctx: 上下文对象。
+    :return:    该上下文的 EventEmitter 实例。
+    """
+    if ctx._events is None:
+        from .events import EventEmitter
+        ctx._events = EventEmitter(ctx)
+    return ctx._events

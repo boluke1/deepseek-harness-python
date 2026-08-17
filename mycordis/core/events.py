@@ -3,15 +3,17 @@
 # 类型化事件系统（Typed Events）：插件间协作的核心通信机制。
 #
 # 设计意图：
-#   对标 DeepSeek Harness / Cordis 的四类事件分发模式，为插件提供
+#   对标 DeepSeek Harness / Cordis 的事件分发模式，为插件提供
 #   解耦的"事件总线"，并复用 Context 的 effect 机制实现"可逆副作用"——
 #   插件卸载（revert）时，其注册的事件监听器会被自动移除，不留残留。
 #
-#   四种模式：
-#     · emit     观察者模式：顺序触发，不等待返回值（广播通知）。
-#     · waterfall 中间件模式：顺序执行，每个监听器可改写传给下一个的值。
-#     · parallel 并行扇出：所有监听器同时执行。
-#     · serial   顺序执行，等待每个完成，并收集所有返回值。
+#   ★ 六种模式（对齐 DSH events.ts）：
+#     · on / once  监听注册：常规监听 + 只触发一次
+#     · emit       观察者模式：顺序触发，不等待返回值（广播通知）。
+#     · waterfall  中间件模式：顺序执行，每个监听器可改写传给下一个的值。
+#     · parallel   并行扇出：所有监听器同时执行。
+#     · serial     顺序执行，等待每个完成，并收集所有返回值。
+#     · bail       短路求值：遇真值立即停止并返回该值。
 #
 # 与 Context 的关系：
 #   每个 Context 持有一个 EventEmitter（懒加载绑定到 ctx._events），
@@ -28,7 +30,7 @@ logger = logging.getLogger(__name__)
 
 class EventEmitter:
     """
-    事件发射器：管理某上下文上的所有事件监听器，提供四种分发模式。
+    事件发射器：管理某上下文上的所有事件监听器，提供六种分发模式。
 
     一个 Context 对应一个 EventEmitter。监听器通过 on() 注册，
     并通过 ctx.effect() 登记为可逆副作用，保证插件卸载时自动移除。
@@ -75,6 +77,25 @@ class EventEmitter:
 
         # 把清理函数交给上下文，纳入副作用栈（LIFO）。
         self.ctx.effect(_remove)
+
+    def once(self, name: str, listener: Callable) -> None:
+        """
+        注册一个"只触发一次"的监听器。
+
+        触发一次后，该监听器会被自动移除，不再响应后续事件。
+        同样通过 ctx.effect() 登记可逆副作用，插件卸载时自动清理。
+
+        :param name:     事件名。
+        :param listener: 监听器函数（可为同步或异步）。
+        """
+        # 内部包装：触发时调用原监听器，然后自动移除自身。
+        def _once_wrapper(payload):
+            # 先移除自己，避免在异步执行期间被再次触发。
+            self.off(name, _once_wrapper)
+            return listener(payload)
+
+        # 用普通 on() 注册包装器（也会登记可逆副作用）。
+        self.on(name, _once_wrapper)
 
     def off(self, name: str, listener: Callable) -> None:
         """
@@ -174,6 +195,30 @@ class EventEmitter:
                 res = await res
             results.append(res)
         return results
+
+    async def bail(self, name: str, value: Any = None) -> Any:
+        """
+        短路求值模式：依次调用监听器，遇真值（truthy）即停止并返回该值。
+
+        对标 DSH 的 bail 语义——常用于"谁先能处理就交给谁"的场景，
+        如权限校验、服务解析短路、多候选处理器竞争。
+
+        :param name:  事件名。
+        :param value: 初始值（可选），会作为第一个监听器的输入。
+        :return:      第一个返回真值的监听器的返回值；
+                     若所有监听器都返回假值，则返回最后一个值（或初始 value）。
+        """
+        result = value
+        for listener in self._get_listeners(name):
+            res = listener(result)
+            if asyncio.iscoroutine(res):
+                res = await res
+            # 遇真值立即短路返回。
+            if res:
+                return res
+            # 否则更新 result，继续下一个监听器。
+            result = res
+        return result
 
 
 def ensure_events(ctx: 'Context') -> EventEmitter:
