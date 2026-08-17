@@ -19,7 +19,11 @@
 #     外部不应直接访问，而应通过 provide/get/effect/revert 等公开方法操作。
 # ============================================================================
 
-from typing import Dict, Any, Optional, Callable, Awaitable, List
+from typing import Dict, Any, Optional, Callable, Awaitable, List,TYPE_CHECKING
+# ---- 新增：延迟导入 EventEmitter，避免 events.py 与 context.py 循环依赖 ----
+if TYPE_CHECKING:
+    from .events import EventEmitter
+
 
 
 class Context:
@@ -60,6 +64,11 @@ class Context:
         # 插件在 apply 中调用 effect() 登记，revert() 时按相反顺序逐个执行，
         # 从而保证"先注册的副作用后清理"，还原到初始状态。
         self._disposers: List[Callable[[], Awaitable[None]]] = []
+
+        # 事件发射器：类型化事件系统（emit/waterfall/parallel/serial）。
+        # 由 events.py 的 EventEmitter 初始化；这里先占位为 None，懒加载。
+        self._events = None
+
 
     # ------------------------------------------------------------------
     # 服务注册与获取
