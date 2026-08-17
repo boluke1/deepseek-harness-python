@@ -44,7 +44,6 @@ harness-python/
 │   ├── loader.py                 # 合并 Bundle / 应用 Patch / 生成加载计划
 │   └── react_profile.py          # 示范 Profile（react-default）
 ├── main.py                       # 入口：配置组装 + 交互式 CLI 多轮对话
-└── test.py                       # 测试脚本
 ```
 
 ## 快速开始
